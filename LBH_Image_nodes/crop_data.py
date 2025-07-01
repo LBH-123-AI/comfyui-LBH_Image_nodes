@@ -3,6 +3,7 @@ import torchvision.transforms as T
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageChops
 import numpy as np
 import cv2
+from nodes import MAX_RESOLUTION
 
 # ==================== 通用工具函数 ====================
 def tensor2pil(image_tensor):
@@ -90,92 +91,95 @@ class CropDataFromFace:
         crop_data = ((face_w, face_h), (left, top, right, bottom))
         return (crop_data,)
 
-# ==================== 节点3：将裁剪图粘贴回原图 ====================
-class Image_Stitch_Crop:
+# ==================== 节点3：人脸检测+裁剪 ====================
+class FaceDetectorWithCrop:
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "crop_image": ("IMAGE",),
-                "crop_data": ("CROP_DATA",),
-                "crop_blending": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "crop_sharpening": ("INT", {"default": 0, "min": 0, "max": 3, "step": 1}),
-            }
-        }
+    def INPUT_TYPES(s):
+        return {"required": {
+                     "image": ("IMAGE", ),
+                     "bbox_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                     "bbox_dilation": ("INT", {"default": 10, "min": -512, "max": 512, "step": 1}),
+                     "bbox_crop_factor": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 10, "step": 0.1}),
+                     "drop_size": ("INT", {"min": 1, "max": MAX_RESOLUTION, "step": 1, "default": 10}),
+                     "bbox_detector": ("BBOX_DETECTOR", ),
+                     },
+                "optional": {
+                    "sam_model_opt": ("SAM_MODEL", ),
+                    "segm_detector_opt": ("SEGM_DETECTOR", ),
+                }}
 
-    RETURN_TYPES = ("IMAGE", "IMAGE")
-    RETURN_NAMES = ("IMAGE", "MASK_IMAGE")
-    FUNCTION = "stitch_image"
-    CATEGORY = "image/processing"
+    RETURN_TYPES = ("SEGS", "MASK", "IMAGE", "CROP_DATA")
+    RETURN_NAMES = ("segs", "mask", "cropped_faces", "crop_data")
+    FUNCTION = "detect_faces"
+    OUTPUT_IS_LIST = (False, False, True, True)
 
-    def stitch_image(self, image, crop_image, crop_data=None, crop_blending=0.25, crop_sharpening=0):
-        if not crop_data:
-            raise ValueError("No crop data provided")
+    CATEGORY = "CustomNodes/FaceDetection"
 
-        result_image, result_mask = self.paste_image(
-            tensor2pil(image),
-            tensor2pil(crop_image),
-            crop_data,
-            crop_blending,
-            crop_sharpening
-        )
-        return (result_image, result_mask)
+    def detect_faces(self, image, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size,
+                    bbox_detector, sam_model_opt=None, segm_detector_opt=None):
+        
+        # 设置默认提示词为'face'
+        if hasattr(bbox_detector, 'setAux'):
+            bbox_detector.setAux('face')
+        
+        # 使用检测器检测人脸
+        segs = bbox_detector.detect(image, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size)
+        
+        if hasattr(bbox_detector, 'setAux'):
+            bbox_detector.setAux(None)
 
-    def paste_image(self, image, crop_image, crop_data, blend_amount=0.25, sharpen_amount=1):
-        def lingrad(size, direction, white_ratio):
-            image = Image.new('RGB', size)
-            draw = ImageDraw.Draw(image)
-            if direction == 'vertical':
-                black_end = int(size[1] * (1 - white_ratio))
-                for y in range(size[1]):
-                    color = (0, 0, 0) if y <= black_end else (int(((y - black_end) / (size[1] - black_end)) * 255),) * 3
-                    draw.line([(0, y), (size[0], y)], fill=color)
-            elif direction == 'horizontal':
-                black_end = int(size[0] * (1 - white_ratio))
-                for x in range(size[0]):
-                    color = (0, 0, 0) if x <= black_end else (int(((x - black_end) / (size[0] - black_end)) * 255),) * 3
-                    draw.line([(x, 0), (x, size[1])], fill=color)
-            return image.convert("L")
+        # 准备输出列表
+        cropped_faces = []
+        crop_data_list = []
+        
+        # 处理每个检测到的人脸
+        for seg in segs[1]:
+            x1, y1, x2, y2 = seg.crop_region
+            # 从原图中裁剪人脸区域
+            face_crop = image[:, y1:y2, x1:x2, :]
+            cropped_faces.append(face_crop)
+            
+            # 添加裁剪数据元信息
+            original_size = (x2 - x1, y2 - y1)
+            crop_coords = (x1, y1, x2, y2)
+            crop_data_list.append((original_size, crop_coords))
 
-        crop_size, (left, top, right, bottom) = crop_data
-        crop_image = crop_image.resize(crop_size)
+        # 生成合并的mask
+        mask = self.segs_to_combined_mask(segs)
 
-        for _ in range(int(sharpen_amount)):
-            crop_image = crop_image.filter(ImageFilter.SHARPEN)
+        return (segs, mask, cropped_faces, crop_data_list)
 
-        blended_image = Image.new('RGBA', image.size, (0, 0, 0, 255))
-        blended_mask = Image.new('L', image.size, 0)
-        crop_padded = Image.new('RGBA', image.size, (0, 0, 0, 0))
-
-        blended_image.paste(image, (0, 0))
-        crop_padded.paste(crop_image, (left, top))
-
-        crop_mask = Image.new('L', crop_image.size, 0)
-        if top > 0:
-            crop_mask = ImageChops.screen(crop_mask, ImageOps.flip(lingrad(crop_image.size, 'vertical', blend_amount)))
-        if left > 0:
-            crop_mask = ImageChops.screen(crop_mask, ImageOps.mirror(lingrad(crop_image.size, 'horizontal', blend_amount)))
-        if right < image.width:
-            crop_mask = ImageChops.screen(crop_mask, lingrad(crop_image.size, 'horizontal', blend_amount))
-        if bottom < image.height:
-            crop_mask = ImageChops.screen(crop_mask, lingrad(crop_image.size, 'vertical', blend_amount))
-
-        crop_mask = ImageOps.invert(crop_mask)
-        blended_mask.paste(crop_mask, (left, top))
-        blended_image.paste(crop_padded, (0, 0), blended_mask)
-
-        return (pil2tensor(blended_image.convert("RGB")), pil2tensor(blended_mask.convert("RGB")))
+    @staticmethod
+    def segs_to_combined_mask(segs):
+        if len(segs[1]) == 0:
+            return torch.zeros((segs[0][0], segs[0][1]), dtype=torch.float32)
+        
+        combined_mask = torch.zeros((segs[0][0], segs[0][1]), dtype=torch.float32)
+        for seg in segs[1]:
+            # 确保mask是torch.Tensor类型
+            mask = seg.cropped_mask
+            if isinstance(mask, np.ndarray):  # 如果是numpy数组，转换为tensor
+                mask = torch.from_numpy(mask).float()
+            
+            x1, y1, x2, y2 = seg.crop_region
+            # 确保区域大小匹配
+            h, w = y2-y1, x2-x1
+            if mask.shape != (h, w):
+                mask = torch.nn.functional.interpolate(mask.unsqueeze(0).unsqueeze(0), size=(h, w), mode='bilinear')[0,0]
+            
+            combined_mask[y1:y2, x1:x2] = torch.maximum(combined_mask[y1:y2, x1:x2], mask)
+        
+        return combined_mask
 
 # ==================== 注册所有节点 ====================
 NODE_CLASS_MAPPINGS = {
     "ImageCropData": WAS_Image_Crop_Data,
     "CropDataFromFace": CropDataFromFace,
-    "Image_Stitch_Crop": Image_Stitch_Crop,
+    "FaceDetectorWithCrop": FaceDetectorWithCrop,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageCropData": "裁剪数据生成",
     "CropDataFromFace": "人脸裁剪数据提取",
-    "Image_Stitch_Crop": "图像粘贴融合",
+    "FaceDetectorWithCrop": "人脸检测+裁剪",
 }
