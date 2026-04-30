@@ -171,15 +171,63 @@ class FaceDetectorWithCrop:
         
         return combined_mask
 
+class FaceBBoxesToCropData:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "face_bboxes": ("BBOX",),  # List[Tuple[x1,y1,x2,y2]]
+                "image": ("IMAGE",),       # [B, H, W, C]
+            }
+        }
+
+    RETURN_TYPES = ("CROP_DATA",)
+    RETURN_NAMES = ("crop_data",)
+    FUNCTION = "convert"
+    CATEGORY = "WanAnimatePreprocess/Utils"
+    DESCRIPTION = "Converts list of face bboxes to CROP_DATA format compatible with FaceDetectorWithCrop."
+    
+    # ⭐ 关键：输出是列表！
+    OUTPUT_IS_LIST = (True,)
+
+    def convert(self, face_bboxes, image):
+        B, H, W, C = image.shape
+        if len(face_bboxes) != B:
+            raise ValueError(f"Number of face_bboxes ({len(face_bboxes)}) does not match batch size ({B})")
+
+        crop_data_list = []
+        for i, bbox in enumerate(face_bboxes):
+            if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+                # 如果 bbox 无效，用 fallback（比如整图）
+                x1, y1, x2, y2 = 0, 0, W, H
+            else:
+                x1, y1, x2, y2 = bbox
+                x1 = max(0, int(round(x1)))
+                y1 = max(0, int(round(y1)))
+                x2 = min(W, int(round(x2)))
+                y2 = min(H, int(round(y2)))
+                if x2 <= x1 or y2 <= y1:
+                    x1, y1, x2, y2 = 0, 0, W, H
+
+            width = x2 - x1
+            height = y2 - y1
+            original_size = (width, height)
+            crop_coords = (x1, y1, x2, y2)
+            crop_data_list.append((original_size, crop_coords))
+
+        return (crop_data_list,)
+
 # ==================== 注册所有节点 ====================
 NODE_CLASS_MAPPINGS = {
     "ImageCropData": WAS_Image_Crop_Data,
     "CropDataFromFace": CropDataFromFace,
     "FaceDetectorWithCrop": FaceDetectorWithCrop,
+    "FaceBBoxesToCropData": FaceBBoxesToCropData, 
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageCropData": "裁剪数据生成",
     "CropDataFromFace": "人脸裁剪数据提取",
     "FaceDetectorWithCrop": "人脸检测+裁剪",
+    "FaceBBoxesToCropData": "Face BBoxes转译Crop Data",  
 }
